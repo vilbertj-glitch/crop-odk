@@ -229,6 +229,13 @@ services:
     # (LOAD_GEO_DATA), and LOAD_ATTRIBUTES/SYNC_GEO_WIDGETS stay off because
     # there is nothing on this side to copy from.
     image: ${MASTER_DATA_IMAGE}
+    build:
+      context: .
+      dockerfile: docker/master-data/Dockerfile
+      platforms:
+        - linux/amd64
+      args:
+        MASTER_DATA_IMAGE: ${MASTER_DATA_IMAGE}
     <<: *amd64
     # NB the settings prefix is `MASTER_DATA_API_`, not the `GEN2_MASTER_DATA_API_`
     # the older GitLab-hosted build used. Getting this wrong is silent: the image
@@ -247,6 +254,8 @@ services:
       MASTER_DATA_API_OPENAPI_ROOT_PATH: /
       COMMON_KEYCLOAK_CLIENT_ID: ${AUTH_CLIENT_ID}
       COMMON_AUTH_PROVIDER_API_URL: http://iam:8000
+      MASTER_DATA_API_CSRF_ENABLED: 'false'
+      COMMON_CSRF_ENABLED: 'false'
     ports:
       - '${MASTER_DATA_PORT}:${MASTER_DATA_PORT}'
     depends_on:

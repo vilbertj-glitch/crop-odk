@@ -14,6 +14,31 @@ from contextvars import ContextVar
 _logger = logging.getLogger("openg2p.odk_ingest_hooks")
 _active_session: ContextVar = ContextVar("odk_active_session", default=None)
 
+# Bridge staff-api / platform settings to iam_core common_ settings
+_redis_url = os.environ.get("REGISTRY_STAFF_PORTAL_API_AUTH_REDIS_URL") or os.environ.get("COMMON_AUTH_REDIS_URL")
+if _redis_url:
+    os.environ["COMMON_AUTH_REDIS_URL"] = _redis_url
+
+_auth_provider_url = os.environ.get("REGISTRY_STAFF_PORTAL_API_AUTH_PROVIDER_API_URL") or os.environ.get("COMMON_AUTH_PROVIDER_API_URL")
+if _auth_provider_url:
+    os.environ["COMMON_AUTH_PROVIDER_API_URL"] = _auth_provider_url
+
+_client_id = os.environ.get("REGISTRY_STAFF_PORTAL_API_KEYCLOAK_CLIENT_ID") or os.environ.get("COMMON_KEYCLOAK_CLIENT_ID")
+if _client_id:
+    os.environ["COMMON_KEYCLOAK_CLIENT_ID"] = _client_id
+
+try:
+    from iam_core.user_auth.config import Settings as IamSettings
+    _iam_cfg = IamSettings.get_config(strict=False)
+    if _redis_url:
+        _iam_cfg.auth_redis_url = _redis_url
+    if _auth_provider_url:
+        _iam_cfg.auth_provider_api_url = _auth_provider_url
+    if _client_id:
+        _iam_cfg.keycloak_client_id = _client_id
+except Exception:
+    pass
+
 
 def _get_registry_engine():
     """Construct an AsyncEngine connected to the primary registry database."""
@@ -456,19 +481,27 @@ def _patch_celery_worker():
                             rows = transformed_data.get(sec_key) or []
                             for row in rows:
                                 fayda = row.get("fayda_fan_id")
+                                clean_fayda = ""
+                                if fayda:
+                                    clean_fayda = str(fayda).strip().replace(" ", "").replace("-", "").replace("/", "")
+                                    if clean_fayda.startswith("FAN"):
+                                        clean_fayda = clean_fayda[3:].lstrip("-").strip()
+                                    if len(clean_fayda) != 16:
+                                        _logger.warning("Fayda ID '%s' is not 16 digits (length=%d)", clean_fayda, len(clean_fayda))
+                                    row["fayda_fan_id"] = clean_fayda
                                 f_name = row.get("farmer_name")
                                 if not row.get("status"):
                                     row["status"] = "DRAFT"
-                                if fayda and (not f_name or not str(f_name).strip() or not row.get("region")):
+                                if clean_fayda and (not f_name or not str(f_name).strip() or not row.get("region")):
                                     res = await session.execute(
                                         text("""
                                             SELECT farmer_name, farmer_id, region, zone, woreda, kebele,
                                                    address_line_1, address_line_2, latitude, longitude, gps_coordinate
                                             FROM g2p_intake_form_crop_sowns
-                                            WHERE fayda_fan_id = :fayda AND farmer_name IS NOT NULL AND farmer_name != ''
+                                            WHERE (fayda_fan_id = :fayda OR fayda_fan_id = 'FAN-' || :fayda) AND farmer_name IS NOT NULL AND farmer_name != ''
                                             ORDER BY created_at DESC LIMIT 1
                                         """),
-                                        {"fayda": str(fayda).strip()}
+                                        {"fayda": clean_fayda}
                                     )
                                     r = res.fetchone()
                                     if not r:
@@ -478,10 +511,10 @@ def _patch_celery_worker():
                                                        address_line_1, address_line_2, latitude, longitude,
                                                        latitude || ', ' || longitude as gps_coordinate
                                                 FROM g2p_register_crop_sowns
-                                                WHERE fayda_fan_id = :fayda AND farmer_name IS NOT NULL AND farmer_name != ''
+                                                WHERE (fayda_fan_id = :fayda OR fayda_fan_id = 'FAN-' || :fayda) AND farmer_name IS NOT NULL AND farmer_name != ''
                                                 ORDER BY created_at DESC LIMIT 1
                                             """),
-                                            {"fayda": str(fayda).strip()}
+                                            {"fayda": clean_fayda}
                                         )
                                         r = res_reg.fetchone()
                                     if r:
@@ -554,6 +587,106 @@ def _patch_celery_worker():
                             lon = lr.get("longitude")
                             if lat and lon and not lr.get("gps_coordinate"):
                                 lr["gps_coordinate"] = f"{lat}, {lon}"
+
+                        # Propagate cluster_name and commodity across stages
+                        for sow in transformed_data.get("cs_sowing_details") or []:
+                            lid = sow.get("land_id")
+                            if not sow.get("cluster_name") and lid:
+                                res_cl = await session.execute(
+                                    text("""
+                                        SELECT cluster_name FROM g2p_intake_form_cultivation_clusters
+                                        WHERE land_id = :lid AND cluster_name IS NOT NULL AND cluster_name != ''
+                                        ORDER BY created_at DESC LIMIT 1
+                                    """),
+                                    {"lid": str(lid).strip()}
+                                )
+                                r_cl = res_cl.fetchone()
+                                if not r_cl:
+                                    res_cl2 = await session.execute(
+                                        text("""
+                                            SELECT cluster_name FROM g2p_intake_form_clusters
+                                            WHERE land_id = :lid AND cluster_name IS NOT NULL AND cluster_name != ''
+                                            ORDER BY created_at DESC LIMIT 1
+                                        """),
+                                        {"lid": str(lid).strip()}
+                                    )
+                                    r_cl = res_cl2.fetchone()
+                                if r_cl and r_cl[0]:
+                                    sow["cluster_name"] = r_cl[0]
+
+                        for inf in transformed_data.get("cs_infestation_details") or []:
+                            lid = inf.get("land_id")
+                            if not inf.get("cluster_name") and lid:
+                                res_cl = await session.execute(
+                                    text("""
+                                        SELECT cluster_name FROM g2p_intake_form_sowings
+                                        WHERE land_id = :lid AND cluster_name IS NOT NULL AND cluster_name != ''
+                                        ORDER BY created_at DESC LIMIT 1
+                                    """),
+                                    {"lid": str(lid).strip()}
+                                )
+                                r_cl = res_cl.fetchone()
+                                if not r_cl:
+                                    res_cl2 = await session.execute(
+                                        text("""
+                                            SELECT cluster_name FROM g2p_intake_form_cultivation_clusters
+                                            WHERE land_id = :lid AND cluster_name IS NOT NULL AND cluster_name != ''
+                                            ORDER BY created_at DESC LIMIT 1
+                                        """),
+                                        {"lid": str(lid).strip()}
+                                    )
+                                    r_cl = res_cl2.fetchone()
+                                if r_cl and r_cl[0]:
+                                    inf["cluster_name"] = r_cl[0]
+                            if not inf.get("commodity") and lid:
+                                res_com = await session.execute(
+                                    text("""
+                                        SELECT commodity FROM g2p_intake_form_sowings
+                                        WHERE land_id = :lid AND commodity IS NOT NULL AND commodity != ''
+                                        ORDER BY created_at DESC LIMIT 1
+                                    """),
+                                    {"lid": str(lid).strip()}
+                                )
+                                r_com = res_com.fetchone()
+                                if r_com and r_com[0]:
+                                    inf["commodity"] = r_com[0]
+
+                        for harv in transformed_data.get("cs_harvest_details") or []:
+                            lid = harv.get("land_id")
+                            if not harv.get("cluster_name") and lid:
+                                res_cl = await session.execute(
+                                    text("""
+                                        SELECT cluster_name FROM g2p_intake_form_sowings
+                                        WHERE land_id = :lid AND cluster_name IS NOT NULL AND cluster_name != ''
+                                        ORDER BY created_at DESC LIMIT 1
+                                    """),
+                                    {"lid": str(lid).strip()}
+                                )
+                                r_cl = res_cl.fetchone()
+                                if not r_cl:
+                                    res_cl2 = await session.execute(
+                                        text("""
+                                            SELECT cluster_name FROM g2p_intake_form_cultivation_clusters
+                                            WHERE land_id = :lid AND cluster_name IS NOT NULL AND cluster_name != ''
+                                            ORDER BY created_at DESC LIMIT 1
+                                        """),
+                                        {"lid": str(lid).strip()}
+                                    )
+                                    r_cl = res_cl2.fetchone()
+                                if r_cl and r_cl[0]:
+                                    harv["cluster_name"] = r_cl[0]
+                            if not harv.get("commodity") and lid:
+                                res_com = await session.execute(
+                                    text("""
+                                        SELECT commodity FROM g2p_intake_form_sowings
+                                        WHERE land_id = :lid AND commodity IS NOT NULL AND commodity != ''
+                                        ORDER BY created_at DESC LIMIT 1
+                                    """),
+                                    {"lid": str(lid).strip()}
+                                )
+                                r_com = res_com.fetchone()
+                                if r_com and r_com[0]:
+                                    harv["commodity"] = r_com[0]
                     except Exception as e:
                         _logger.debug("Error in auto-enriching intake submission: %s", e)
 
@@ -622,6 +755,11 @@ def _patch_intake_form_data_service():
                 session,
                 root_record_id_mapping=None,
             ):
+                if hasattr(intake_row, "cluster_crop_maturity_status") and intake_row.cluster_crop_maturity_status == "NOT_YET_READY":
+                    intake_row.cluster_crop_maturity_status = "NOT_YET_READY_FOR_HARVEST"
+                if hasattr(intake_row, "agro_ecological_zone") and intake_row.agro_ecological_zone:
+                    if str(intake_row.agro_ecological_zone).upper() in ("KUR", "KURRE"):
+                        intake_row.agro_ecological_zone = "WURCH"
                 res = await orig_insert(
                     self,
                     submission,
@@ -729,25 +867,29 @@ def _patch_intake_form_data_service():
 
                 intake_lands = set()
                 if fayda_fan_id:
+                    clean_fayda = str(fayda_fan_id).strip()
+                    if clean_fayda.startswith("FAN-"):
+                        clean_fayda = clean_fayda[4:].strip()
+                    clean_fayda = clean_fayda.replace(" ", "").replace("-", "")
                     res_fayda = (
                         await session.execute(
                             text("""
                                 SELECT DISTINCT p.land_id 
                                 FROM g2p_intake_form_plannings p
                                 JOIN g2p_intake_form_crop_sowns cs ON p.submission_id = cs.submission_id
-                                WHERE cs.fayda_fan_id = :fayda AND p.land_id IS NOT NULL
+                                WHERE (cs.fayda_fan_id = :fayda OR cs.fayda_fan_id = 'FAN-' || :fayda) AND p.land_id IS NOT NULL
                                 UNION
                                 SELECT DISTINCT c.land_id 
                                 FROM g2p_intake_form_cultivations c
                                 JOIN g2p_intake_form_crop_sowns cs ON c.submission_id = cs.submission_id
-                                WHERE cs.fayda_fan_id = :fayda AND c.land_id IS NOT NULL
+                                WHERE (cs.fayda_fan_id = :fayda OR cs.fayda_fan_id = 'FAN-' || :fayda) AND c.land_id IS NOT NULL
                                 UNION
                                 SELECT DISTINCT s.land_id 
                                 FROM g2p_intake_form_sowings s
                                 JOIN g2p_intake_form_crop_sowns cs ON s.submission_id = cs.submission_id
-                                WHERE cs.fayda_fan_id = :fayda AND s.land_id IS NOT NULL
+                                WHERE (cs.fayda_fan_id = :fayda OR cs.fayda_fan_id = 'FAN-' || :fayda) AND s.land_id IS NOT NULL
                             """),
-                            {"fayda": fayda_fan_id}
+                            {"fayda": clean_fayda}
                         )
                     ).scalars().all()
                     intake_lands.update([str(l).strip() for l in res_fayda if l and str(l).strip()])
@@ -771,6 +913,232 @@ def _patch_intake_form_data_service():
 
         G2PIntakeFormDataService._validate_land_ids_against_fayda_records = patched_validate_land_ids
         _logger.info("ODK Hook: Patched G2PIntakeFormDataService._validate_land_ids_against_fayda_records")
+
+        if not hasattr(G2PIntakeFormDataService, "_odk_patched_stage_order_approval"):
+            G2PIntakeFormDataService._odk_patched_stage_order_approval = True
+
+            async def _validate_stage_order_for_approval(self, submission, session) -> None:
+                from sqlalchemy import text
+                from openg2p_registry_core.errors import G2PRegistryException, G2PRegistryErrorCodes
+
+                res_hdr = await session.execute(
+                    text("""
+                        SELECT s.form_id, d.form_mnemonic, cs.fayda_fan_id, cs.crop_year, cs.production_season, cs.lifecycle_stage, cs.land_id
+                        FROM g2p_intake_form_submissions s
+                        JOIN g2p_intake_form_definitions d ON s.form_id = d.form_id
+                        LEFT JOIN g2p_intake_form_crop_sowns cs ON s.submission_id = cs.submission_id
+                        WHERE s.submission_id = :sub_id
+                    """),
+                    {"sub_id": submission.submission_id},
+                )
+                row = res_hdr.fetchone()
+                if not row:
+                    return
+
+                form_mnemonic = str(row[1] or "")
+                fayda_fan_id = str(row[2] or "").strip()
+                crop_year = str(row[3] or "").strip()
+                prod_season = str(row[4] or "").strip()
+                lifecycle_stage = str(row[5] or "").strip().upper()
+                land_id = str(row[6] or "").strip()
+
+                is_sowing = (lifecycle_stage == "SOWING" or form_mnemonic == "Crop Sown Sowing Intake")
+                is_harvesting = (lifecycle_stage == "HARVESTING" or form_mnemonic == "Crop Sown Harvesting Intake")
+
+                if not is_sowing and not is_harvesting:
+                    return
+
+                if not fayda_fan_id:
+                    tbl = "g2p_intake_form_sowings" if is_sowing else "g2p_intake_form_harvests"
+                    res_sub = await session.execute(
+                        text(f"SELECT fayda_fan_id, crop_year, season, land_id FROM {tbl} WHERE submission_id = :sub_id LIMIT 1"),
+                        {"sub_id": submission.submission_id},
+                    )
+                    sub_row = res_sub.fetchone()
+                    if sub_row:
+                        fayda_fan_id = str(sub_row[0] or fayda_fan_id).strip()
+                        crop_year = str(sub_row[1] or crop_year).strip()
+                        prod_season = str(sub_row[2] or prod_season).strip()
+                        land_id = str(sub_row[3] or land_id).strip()
+
+                if not fayda_fan_id:
+                    return
+
+                query_m = (
+                    "SELECT internal_record_id::text, crop_year, production_season "
+                    "FROM g2p_register_crop_sowns "
+                    "WHERE fayda_fan_id = :fayda AND record_status = 'ACTIVE'"
+                )
+                params_m = {"fayda": fayda_fan_id}
+                if crop_year:
+                    query_m += " AND crop_year = :c_year"
+                    params_m["c_year"] = crop_year
+
+                res_m = await session.execute(text(query_m), params_m)
+                rows_m = res_m.fetchall()
+
+                matching_master_ids = []
+                p_clean = str(prod_season).replace("CROP_SEASON_", "").strip().upper() if prod_season else ""
+                for rm in rows_m:
+                    r_season = str(rm[2] or "").replace("CROP_SEASON_", "").strip().upper()
+                    if not p_clean or p_clean == r_season:
+                        matching_master_ids.append(rm[0])
+
+                stage_name = "Sowing" if is_sowing else "Harvesting"
+                if not matching_master_ids:
+                    year_info = f" in Crop Year '{crop_year}'" if crop_year else ""
+                    season_info = f" and Season '{prod_season}'" if prod_season else ""
+                    prereq_msg = "Planning and Cultivation must be approved first." if is_sowing else "Sowing must be approved first."
+                    raise G2PRegistryException(
+                        code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                        message=(
+                            f"Cannot approve {stage_name} submission '{submission.submission_id}': "
+                            f"No ACTIVE Crop Sown register record found for Fayda ID '{fayda_fan_id}'{year_info}{season_info}. "
+                            f"{prereq_msg}"
+                        ),
+                    )
+
+                if is_sowing:
+                    q_p = "SELECT 1 FROM g2p_register_plannings WHERE link_internal_record_id = ANY(:m_ids) AND record_status = 'ACTIVE'"
+                    params_p = {"m_ids": matching_master_ids}
+                    if land_id:
+                        res_p_land = await session.execute(
+                            text(q_p + " AND (land_id = :lid OR TRIM(land_id) = :lid) LIMIT 1"),
+                            {**params_p, "lid": land_id},
+                        )
+                        if not res_p_land.fetchone():
+                            res_p_any = await session.execute(text(q_p + " LIMIT 1"), params_p)
+                            if not res_p_any.fetchone():
+                                raise G2PRegistryException(
+                                    code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                    message=(
+                                        f"Cannot approve Sowing submission '{submission.submission_id}': "
+                                        f"Prerequisite Planning stage has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                        f"Planning must be approved before Sowing."
+                                    ),
+                                )
+                            else:
+                                raise G2PRegistryException(
+                                    code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                    message=(
+                                        f"Cannot approve Sowing submission '{submission.submission_id}': "
+                                        f"Prerequisite Planning stage for Land ID '{land_id}' has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                        f"Planning must be approved before Sowing."
+                                    ),
+                                )
+                    else:
+                        res_p = await session.execute(text(q_p + " LIMIT 1"), params_p)
+                        if not res_p.fetchone():
+                            raise G2PRegistryException(
+                                code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                message=(
+                                    f"Cannot approve Sowing submission '{submission.submission_id}': "
+                                    f"Prerequisite Planning stage has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                    f"Planning must be approved before Sowing."
+                                ),
+                            )
+
+                    q_c = "SELECT 1 FROM g2p_register_cultivations WHERE link_internal_record_id = ANY(:m_ids) AND record_status = 'ACTIVE'"
+                    params_c = {"m_ids": matching_master_ids}
+                    if land_id:
+                        res_c_land = await session.execute(
+                            text(q_c + " AND (land_id = :lid OR TRIM(land_id) = :lid) LIMIT 1"),
+                            {**params_c, "lid": land_id},
+                        )
+                        if not res_c_land.fetchone():
+                            res_c_any = await session.execute(text(q_c + " LIMIT 1"), params_c)
+                            if not res_c_any.fetchone():
+                                raise G2PRegistryException(
+                                    code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                    message=(
+                                        f"Cannot approve Sowing submission '{submission.submission_id}': "
+                                        f"Prerequisite Cultivation stage has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                        f"Cultivation must be approved before Sowing."
+                                    ),
+                                )
+                            else:
+                                raise G2PRegistryException(
+                                    code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                    message=(
+                                        f"Cannot approve Sowing submission '{submission.submission_id}': "
+                                        f"Prerequisite Cultivation stage for Land ID '{land_id}' has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                        f"Cultivation must be approved before Sowing."
+                                    ),
+                                )
+                    else:
+                        res_c = await session.execute(text(q_c + " LIMIT 1"), params_c)
+                        if not res_c.fetchone():
+                            raise G2PRegistryException(
+                                code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                message=(
+                                    f"Cannot approve Sowing submission '{submission.submission_id}': "
+                                    f"Prerequisite Cultivation stage has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                    f"Cultivation must be approved before Sowing."
+                                ),
+                            )
+
+                elif is_harvesting:
+                    q_s = "SELECT 1 FROM g2p_register_sowings WHERE link_internal_record_id = ANY(:m_ids) AND record_status = 'ACTIVE'"
+                    params_s = {"m_ids": matching_master_ids}
+                    if land_id:
+                        res_s_land = await session.execute(
+                            text(q_s + " AND (land_id = :lid OR TRIM(land_id) = :lid) LIMIT 1"),
+                            {**params_s, "lid": land_id},
+                        )
+                        if not res_s_land.fetchone():
+                            res_s_any = await session.execute(text(q_s + " LIMIT 1"), params_s)
+                            if not res_s_any.fetchone():
+                                raise G2PRegistryException(
+                                    code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                    message=(
+                                        f"Cannot approve Harvesting submission '{submission.submission_id}': "
+                                        f"Prerequisite Sowing stage has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                        f"Sowing must be approved before Harvesting."
+                                    ),
+                                )
+                            else:
+                                raise G2PRegistryException(
+                                    code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                    message=(
+                                        f"Cannot approve Harvesting submission '{submission.submission_id}': "
+                                        f"Prerequisite Sowing stage for Land ID '{land_id}' has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                        f"Sowing must be approved before Harvesting."
+                                    ),
+                                )
+                    else:
+                        res_s = await session.execute(text(q_s + " LIMIT 1"), params_s)
+                        if not res_s.fetchone():
+                            raise G2PRegistryException(
+                                code=G2PRegistryErrorCodes.REQUEST_VALIDATION_ERROR.value[1],
+                                message=(
+                                    f"Cannot approve Harvesting submission '{submission.submission_id}': "
+                                    f"Prerequisite Sowing stage has not been approved into the Crop Sown registry for Fayda ID '{fayda_fan_id}'. "
+                                    f"Sowing must be approved before Harvesting."
+                                ),
+                            )
+
+            G2PIntakeFormDataService._validate_stage_order_for_approval = _validate_stage_order_for_approval
+
+            orig_approve = G2PIntakeFormDataService.approve_submission
+            orig_approve_with_session = G2PIntakeFormDataService.approve_submission_with_session
+
+            async def patched_approve(self, submission_id: str, approved_by: str):
+                from openg2p_fastapi_common.context import dbengine
+                from sqlalchemy.ext.asyncio import async_sessionmaker
+                session_maker = async_sessionmaker(dbengine.get(), expire_on_commit=False)
+                async with session_maker() as session:
+                    submission = await self._get_submission_or_error(submission_id, session)
+                    await self._validate_stage_order_for_approval(submission, session)
+                return await orig_approve(self, submission_id, approved_by)
+
+            async def patched_approve_with_session(self, submission_id: str, session, approved_by: str | None = None):
+                submission = await self._get_submission_or_error(submission_id, session)
+                await self._validate_stage_order_for_approval(submission, session)
+                return await orig_approve_with_session(self, submission_id, session, approved_by=approved_by)
+
+            G2PIntakeFormDataService.approve_submission = patched_approve
+            G2PIntakeFormDataService.approve_submission_with_session = patched_approve_with_session
+            _logger.info("ODK Hook: Patched G2PIntakeFormDataService stage-order approval gate")
     except Exception as e:
         _logger.debug("Could not patch G2PIntakeFormDataService: %s", e)
 
@@ -911,9 +1279,28 @@ def _patch_sowing_service():
             return
         G2PRegisterDomainServiceSowing._odk_patched_sowing = True
 
+        orig_validate_existing_crop_sown = getattr(
+            G2PRegisterDomainServiceSowing,
+            "_validate_existing_crop_sown_record_required",
+            None,
+        )
         orig_validate_sowing_area = G2PRegisterDomainServiceSowing._validate_sowing_area_after_cultivation
         orig_validate_sowing_after_cult = G2PRegisterDomainServiceSowing._validate_sowing_after_cultivation
         orig_validate_land_id = G2PRegisterDomainServiceSowing._validate_land_id_matches_planning
+
+        async def patched_validate_existing_crop_sown(self, record: dict, session=None):
+            if _active_session.get() is not None:
+                # ODK ingestion session — skip this check entirely.
+                # Planning/Cultivation approval is enforced later at the staff-approval stage;
+                # this only unblocks the Sowing *intake* record from being created pre-approval.
+                _logger.warning(
+                    "ODK cross-stage validation skipped: _validate_existing_crop_sown_record_required for Fayda=%s land_id=%s",
+                    record.get("fayda_fan_id") or record.get("fayda_id"),
+                    record.get("land_id"),
+                )
+                return
+            if orig_validate_existing_crop_sown:
+                return await orig_validate_existing_crop_sown(self, record, session=session)
 
         async def patched_validate_sowing_area(self, record: dict, session):
             try:
@@ -1014,6 +1401,8 @@ def _patch_sowing_service():
                             return
                 raise exc
 
+        if orig_validate_existing_crop_sown:
+            G2PRegisterDomainServiceSowing._validate_existing_crop_sown_record_required = patched_validate_existing_crop_sown
         G2PRegisterDomainServiceSowing._validate_sowing_area_after_cultivation = patched_validate_sowing_area
         G2PRegisterDomainServiceSowing._validate_sowing_after_cultivation = patched_validate_sowing_after_cult
         G2PRegisterDomainServiceSowing._validate_land_id_matches_planning = patched_validate_land_id
@@ -1041,10 +1430,26 @@ def _patch_harvest_service():
             return
         G2PRegisterDomainServiceHarvest._odk_patched_harvest = True
 
+        orig_validate_existing_crop_sown_harvest = getattr(
+            G2PRegisterDomainServiceHarvest,
+            "_validate_existing_crop_sown_record_required",
+            None,
+        )
         orig_validate_harvest_after_sowing = G2PRegisterDomainServiceHarvest._validate_harvest_after_sowing
         orig_validate_harvest_area = G2PRegisterDomainServiceHarvest._validate_harvest_area_after_sowing
         orig_validate_land_id = G2PRegisterDomainServiceHarvest._validate_land_id_matches_sowing
         orig_validate_harvest_season_date = G2PRegisterDomainServiceHarvest._validate_date_in_season_enhanced
+
+        async def patched_validate_existing_crop_sown_harvest(self, record: dict, session=None):
+            if _active_session.get() is not None:
+                _logger.warning(
+                    "ODK cross-stage validation skipped: _validate_existing_crop_sown_record_required (Harvest) for Fayda=%s land_id=%s",
+                    record.get("fayda_fan_id") or record.get("fayda_id"),
+                    record.get("land_id"),
+                )
+                return
+            if orig_validate_existing_crop_sown_harvest:
+                return await orig_validate_existing_crop_sown_harvest(self, record, session=session)
 
         async def patched_validate_harvest_season_date(self, record: dict, field: str, session):
             try:
@@ -1232,6 +1637,8 @@ def _patch_harvest_service():
                             return
                 raise exc
 
+        if orig_validate_existing_crop_sown_harvest:
+            G2PRegisterDomainServiceHarvest._validate_existing_crop_sown_record_required = patched_validate_existing_crop_sown_harvest
         G2PRegisterDomainServiceHarvest._validate_harvest_after_sowing = patched_validate_harvest_after_sowing
         G2PRegisterDomainServiceHarvest._validate_harvest_area_after_sowing = patched_validate_harvest_area
         G2PRegisterDomainServiceHarvest._validate_land_id_matches_sowing = patched_validate_land_id
@@ -1239,6 +1646,129 @@ def _patch_harvest_service():
         _logger.info("ODK Hook: Patched G2PRegisterDomainServiceHarvest")
     except Exception as e:
         _logger.debug("Could not patch G2PRegisterDomainServiceHarvest: %s", e)
+
+
+def _patch_awe_proxy_controller_service():
+    """Patch G2PAweProxyControllerService when AWE is disabled."""
+    try:
+        from openg2p_registry_core.controller_services.g2p_awe_proxy_controller_service import (
+            G2PAweProxyControllerService,
+        )
+        from openg2p_registry_core.helpers.awe_config import get_awe_settings
+
+        orig_list_my_tasks = G2PAweProxyControllerService.list_my_tasks
+        orig_list_tasks_for_request = G2PAweProxyControllerService.list_tasks_for_request
+        orig_my_task_stats = G2PAweProxyControllerService.my_task_stats
+
+        async def patched_list_my_tasks(self, payload=None, *, bearer_token: str):
+            if not get_awe_settings().awe_enabled:
+                return {
+                    "items": [],
+                    "total": 0,
+                    "page": getattr(payload, "page", 1) if payload else 1,
+                    "page_size": getattr(payload, "page_size", 10) if payload else 10,
+                }
+            return await orig_list_my_tasks(self, payload, bearer_token=bearer_token)
+
+        async def patched_list_tasks_for_request(self, payload=None, *, bearer_token: str):
+            if not get_awe_settings().awe_enabled:
+                return {"items": [], "total": 0}
+            return await orig_list_tasks_for_request(self, payload, bearer_token=bearer_token)
+
+        async def patched_my_task_stats(self, payload=None, *, bearer_token: str):
+            if not get_awe_settings().awe_enabled:
+                return {
+                    "total": 0,
+                    "change_request_count": 0,
+                    "intake_form_count": 0,
+                }
+            return await orig_my_task_stats(self, payload, bearer_token=bearer_token)
+
+        G2PAweProxyControllerService.list_my_tasks = patched_list_my_tasks
+        G2PAweProxyControllerService.list_tasks_for_request = patched_list_tasks_for_request
+        G2PAweProxyControllerService.my_task_stats = patched_my_task_stats
+        _logger.info("ODK Hook: Patched G2PAweProxyControllerService for awe_enabled guard")
+    except Exception as e:
+        _logger.debug("Could not patch G2PAweProxyControllerService: %s", e)
+
+
+def _patch_document_service():
+    """Ensure G2PDocumentService auto-instantiates on get_component()."""
+    try:
+        from openg2p_registry_core.services.g2p_document_service import G2PDocumentService
+        orig_get_component = G2PDocumentService.get_component
+
+        @classmethod
+        def patched_get_component(cls, name="", strict=False):
+            comp = orig_get_component(name=name, strict=strict)
+            if comp is None:
+                comp = cls(name=name)
+            return comp
+
+        G2PDocumentService.get_component = patched_get_component
+        _logger.info("ODK Hook: Patched G2PDocumentService.get_component")
+    except Exception as e:
+        _logger.debug("Could not patch G2PDocumentService: %s", e)
+
+
+def _patch_auth_redis():
+    """Ensure RedisRefreshTokenStore uses redis://redis:6379/0."""
+    try:
+        redis_url = (
+            os.environ.get("REGISTRY_STAFF_PORTAL_API_AUTH_REDIS_URL")
+            or os.environ.get("COMMON_AUTH_REDIS_URL")
+            or "redis://redis:6379/0"
+        )
+        if "COMMON_AUTH_REDIS_URL" not in os.environ:
+            os.environ["COMMON_AUTH_REDIS_URL"] = redis_url
+        from iam_core.services.redis_refresh_token_store import RedisRefreshTokenStore
+        orig_init = RedisRefreshTokenStore.__init__
+
+        def patched_init(self, ttl_seconds=None, redis_url_arg=None):
+            if not redis_url_arg or "localhost" in redis_url_arg:
+                redis_url_arg = redis_url
+            orig_init(self, ttl_seconds=ttl_seconds, redis_url=redis_url_arg)
+
+        RedisRefreshTokenStore.__init__ = patched_init
+    except Exception as e:
+        _logger.debug("Could not patch RedisRefreshTokenStore: %s", e)
+
+
+def _patch_fayda_validation():
+    """Allow clean 16-digit fayda_fan_id to pass validation in domain schemas and services."""
+    try:
+        import re
+        from openg2p_registry_cropsown_extension.register_domain.schemas.crop_sown import G2PRegisterSchemaCropSown, G2PSchemaCropSown
+
+        @classmethod
+        def patched_validate(cls, v):
+            if v is not None and str(v).strip() != "":
+                s = str(v).strip().replace(" ", "").replace("-", "")
+                if not re.match(r"^\d{16}$", s):
+                    raise ValueError(f"Fayda ID must be 16 digits (got '{v}')")
+            return v
+
+        for schema_cls in (G2PRegisterSchemaCropSown, G2PSchemaCropSown):
+            if hasattr(schema_cls, "__pydantic_decorators__") and "validate_fayda_fan_id" in schema_cls.__pydantic_decorators__.field_validators:
+                schema_cls.__pydantic_decorators__.field_validators["validate_fayda_fan_id"].func = patched_validate.__get__(schema_cls, schema_cls)
+                schema_cls.__pydantic_complete__ = False
+                schema_cls.model_rebuild(force=True)
+
+        from openg2p_registry_cropsown_extension.register_domain.services.g2p_register_domain_service_crop_sown import G2PRegisterDomainServiceCropSown
+        from openg2p_registry_cropsown_extension.register_domain.services.domain_validation_utils import validation_error
+
+        def patched_service_validate_fayda(self, record):
+            value = record.get("fayda_fan_id")
+            if value is None or str(value).strip() in ("", "None", "null", "Select"):
+                validation_error("Fayda ID (FAN) is required in Farmer Identity.")
+            s = str(value).strip().replace(" ", "").replace("-", "")
+            if not re.match(r"^\d{16}$", s):
+                validation_error(f"Fayda ID must be 16 digits (got '{value}')")
+
+        G2PRegisterDomainServiceCropSown._validate_fayda_fan_id = patched_service_validate_fayda
+        _logger.info("ODK Hook: Patched fayda_fan_id validation to accept clean 16 digits")
+    except Exception as e:
+        _logger.debug("Could not patch fayda validation: %s", e)
 
 
 def install_hooks():
@@ -1257,6 +1787,12 @@ def install_hooks():
     _patch_cultivation_service()
     _patch_sowing_service()
     _patch_harvest_service()
+    _patch_awe_proxy_controller_service()
+    _patch_document_service()
+    _patch_auth_redis()
+    _patch_fayda_validation()
 
 
 install_hooks()
+
+
